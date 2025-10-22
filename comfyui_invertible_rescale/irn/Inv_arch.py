@@ -104,7 +104,7 @@ class ConvDownsampling(nn.Module):
             conv_weights = self.conv_weights.reshape(self.scale2, self.scale2, 1, 1)
             conv_weights = conv_weights.repeat(C, 1, 1, 1)
             out = F.conv2d(x, conv_weights, bias=None, stride=1, groups=C)
-            out = out.reshape(B, C, self.scale2, H // self.scale, W // self.scale)
+            out = out.reshape(B, C, self.scale, self.scale, H // self.scale, W // self.scale)
             out = torch.transpose(out, 1, 2)
             out = out.reshape(B, C * self.scale2, H // self.scale, W // self.scale)
             return out
@@ -171,4 +171,4 @@ class InvRescaleNet(nn.Module):
         if cal_jacobian:
             return out, jacobian
         else:
-            return out.
+            return out
