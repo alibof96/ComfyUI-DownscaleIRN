@@ -27,6 +27,10 @@ REGISTRY_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "model_
 
 FILENAME_SCALE_RE = re.compile(r"x([2348])(\D|$)", re.IGNORECASE)
 
+def _log(verbose: bool, msg: str):
+    if verbose:
+        print(f"[DownscaleIRN] {msg}")
+
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
@@ -37,10 +41,11 @@ def _sha256(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def _download(url: str, dest: str, expected_sha256: Optional[str] = None):
+def _download(url: str, dest: str, expected_sha256: Optional[str] = None, verbose: bool = False):
     import urllib.request
     _ensure_dir(os.path.dirname(dest))
     tmp = dest + ".part"
+    _log(verbose, f"Downloading: {url} -> {dest}")
     with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
         while True:
             chunk = r.read(1024 * 1024)
@@ -54,11 +59,13 @@ def _download(url: str, dest: str, expected_sha256: Optional[str] = None):
                 os.remove(tmp)
             except OSError:
                 pass
-            raise RuntimeError(f"Hash mismatch for {url}. expected={{expected_sha256}} got={{got}}")
+            raise RuntimeError(f"Hash mismatch for {url}. expected={expected_sha256} got={got}")
     os.replace(tmp, dest)
+    _log(verbose, f"Downloaded OK: {dest}")
 
-def _load_registry() -> Dict:
+def _load_registry(verbose: bool = False) -> Dict:
     if not os.path.exists(REGISTRY_PATH):
+        _log(verbose, f"Registry not found, using defaults: {REGISTRY_PATH}")
         return {
             "models_dir": DEFAULT_MODELS_DIR,
             "google_drive_folder_url": "https://drive.google.com/drive/folders/1ym6DvYNQegDrOy_4z733HxrULa1XIN92",
@@ -74,21 +81,23 @@ def _load_registry() -> Dict:
             }
         }
     with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        reg = json.load(f)
+    _log(verbose, f"Loaded registry from {REGISTRY_PATH}")
+    return reg
 
 def _discover_local_models(models_dir: str) -> Dict[str, Dict]:
     results = {}
     if not os.path.isdir(models_dir):
         return results
     for fn in os.listdir(models_dir):
-        if not fn.lower().endswith(('.pt', '.pth')):
+        if not fn.lower().endswith((".pt", ".pth")):
             continue
         path = os.path.join(models_dir, fn)
         key = os.path.splitext(fn)[0]
         m = FILENAME_SCALE_RE.search(fn)
         sc = int(m.group(1)) if m else None
         results[key] = {
-            "description": f"Local file: {{fn}}",
+            "description": f"Local file: {fn}",
             "scale": [sc] if sc else [],
             "source": "local",
             "path": path,
@@ -154,7 +163,8 @@ class _IRNDownscaleWrapper(nn.Module):
         y = self.core(x, rev=False)
         return y[:, :3, :, :]
 
-def _load_irn_from_state_dict(model_path: str, device: torch.device, dtype, scale: int) -> nn.Module:
+def _load_irn_from_state_dict(model_path: str, device: torch.device, dtype, scale: int, verbose: bool = False) -> nn.Module:
+    _log(verbose, f"Constructing IRN architecture for scale={scale}")
     arch = _build_irn_arch_config(scale)
     sub = subnet('DBNet', init='xavier', gc=32)
     model = InvRescaleNet(
@@ -163,6 +173,7 @@ def _load_irn_from_state_dict(model_path: str, device: torch.device, dtype, scal
         down_first=arch["down_first"], use_ConvDownsampling=arch["use_ConvDownsampling"],
         down_scale=arch["down_scale"]
     )
+    _log(verbose, f"Loading checkpoint: {model_path}")
     ckpt = torch.load(model_path, map_location="cpu")
     if isinstance(ckpt, dict):
         if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
@@ -182,43 +193,52 @@ def _load_irn_from_state_dict(model_path: str, device: torch.device, dtype, scal
         if not isinstance(k, str):
             continue
         nk = k
-        for prefix in ["module.", "netG.", "model.", "G."]:
+        for prefix in ["module.", "netG.", "model.", "G."]:  
             if nk.startswith(prefix):
                 nk = nk[len(prefix):]
         cleaned[nk] = v
-    model.load_state_dict(cleaned, strict=False)
+    missing, unexpected = model.load_state_dict(cleaned, strict=False)
+    _log(verbose, f"Loaded state_dict (missing={len(missing)}, unexpected={len(unexpected)})")
     model.eval()
     model = model.to(device=device, dtype=dtype)
     return _IRNDownscaleWrapper(model)
 
-def _load_model_generic(model_path: str, device: torch.device, dtype, scale: int) -> nn.Module:
+def _load_model_generic(model_path: str, device: torch.device, dtype, scale: int, verbose: bool = False) -> nn.Module:
     try:
+        _log(verbose, f"Trying torch.jit.load for: {model_path}")
         m = torch.jit.load(model_path, map_location=device)
         m.eval()
+        _log(verbose, "Loaded TorchScript model")
         return m.to(device=device, dtype=dtype)
-    except Exception:
-        pass
+    except Exception as e:
+        _log(verbose, f"TorchScript load failed: {e}")
     try:
+        _log(verbose, f"Trying torch.load nn.Module for: {model_path}")
         obj = torch.load(model_path, map_location=device)
         if hasattr(obj, "eval") and isinstance(obj, nn.Module):
             obj.eval()
+            _log(verbose, "Loaded pickled nn.Module")
             return obj.to(device=device, dtype=dtype)
-    except Exception:
-        pass
-    return _load_irn_from_state_dict(model_path, device, dtype, scale)
+    except Exception as e:
+        _log(verbose, f"Pickled nn.Module load failed: {e}")
+    _log(verbose, "Falling back to IRN state_dict loader")
+    return _load_irn_from_state_dict(model_path, device, dtype, scale, verbose=verbose)
 
-def _ensure_model_from_registry(model_key: str, registry: Dict) -> Optional[str]:
+def _ensure_model_from_registry(model_key: str, registry: Dict, verbose: bool = False) -> Optional[str]:
     entry = registry["models"].get(model_key)
     if not entry or entry.get("source") == "builtin":
         return None
     models_dir = os.path.expanduser(registry.get("models_dir", DEFAULT_MODELS_DIR))
     _ensure_dir(models_dir)
-    filename = entry.get("filename") or f"{{model_key}}.pt"
+    filename = entry.get("filename") or f"{model_key}.pt"
     dest = os.path.join(models_dir, filename)
+
     if os.path.exists(dest):
+        _log(verbose, f"Found existing model at {dest}")
         if entry.get("sha256"):
             got = _sha256(dest)
             if got.lower() != entry["sha256"].lower():
+                _log(verbose, f"SHA256 mismatch for {dest}, re-downloading")
                 try:
                     os.remove(dest)
                 except OSError:
@@ -227,15 +247,21 @@ def _ensure_model_from_registry(model_key: str, registry: Dict) -> Optional[str]
                 return dest
         else:
             return dest
+
     url = entry.get("url", "")
     if url:
-        _download(url, dest, expected_sha256=entry.get("sha256"))
+        _download(url, dest, expected_sha256=entry.get("sha256"), verbose=verbose)
         return dest
+
     gdf = registry.get("google_drive_folder_url", "")
     if gdf and download_gdrive_folder:
+        _log(verbose, f"Downloading from Google Drive folder -> {models_dir}")
         download_gdrive_folder(gdf, models_dir)
         if os.path.exists(dest):
+            _log(verbose, f"Found downloaded file at {dest}")
             return dest
+        else:
+            _log(verbose, f"Expected file {filename} not found after GDrive download")
     return None
 
 def _build_model_choices(registry: Dict) -> Tuple[List[str], Dict[str, Dict]]:
@@ -250,7 +276,7 @@ def _build_model_choices(registry: Dict) -> Tuple[List[str], Dict[str, Dict]]:
             merged[k] = v
             merged[k]["_kind"] = "local"
     merged["auto_best_match"] = {
-        "description": "Pick IRN_x{{scale}} if present (downloads if enabled), else fallback to builtin.",
+        "description": "Pick IRN_x{scale} if present (downloads if enabled), else fallback to builtin.",
         "scale": [2, 3, 4],
         "source": "virtual",
         "_kind": "virtual"
@@ -284,7 +310,8 @@ class IRNDownscale:
                 "auto_download_selected": ("BOOLEAN", {"default": True}),
                 "auto_download_all": ("BOOLEAN", {"default": False}),
                 "use_google_drive": ("BOOLEAN", {"default": True}),
-                "models_dir_override": ("STRING", {"default": ""})
+                "models_dir_override": ("STRING", {"default": ""}),
+                "verbose": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -293,15 +320,18 @@ class IRNDownscale:
     FUNCTION = "downscale"
     CATEGORY = "image/resize"
 
-    def _maybe_prepare_input(self, image: torch.Tensor, scale: int, mode: str) -> Tuple[torch.Tensor, Optional[Tuple[int,int,int,int]]]:
+    def _maybe_prepare_input(self, image: torch.Tensor, scale: int, mode: str, verbose: bool) -> Tuple[torch.Tensor, Optional[Tuple[int,int,int,int]]]:
         x = _to_torch_chw(image)
         if mode == "pad":
-            x, pad = _pad_to_multiple(x, scale)
-            return x, pad
+            x2, pad = _pad_to_multiple(x, scale)
+            if pad != (0,0,0,0):
+                _log(verbose, f"Pad to multiple of {scale}: pad={pad}")
+            return x2, pad
         if mode == "crop":
             b, c, h, w = x.shape
             h2 = h - (h % scale)
             w2 = w - (w % scale)
+            _log(verbose, f"Crop to divisible: ({h},{w}) -> ({h2},{w2})")
             return x[:, :, :h2, :w2].contiguous(), None
         if mode == "resize_to_multiple":
             b, c, h, w = x.shape
@@ -309,11 +339,12 @@ class IRNDownscale:
             w2 = w - (w % scale)
             if h2 == h and w2 == w:
                 return x, None
+            _log(verbose, f"Resize to multiple via area: ({h},{w}) -> ({h2},{w2})")
             x = F.interpolate(x, size=(h2, w2), mode="area", antialias=True)
             return x, None
         return x, None
 
-    def _run_model(self, x_bchw: torch.Tensor, model: nn.Module, tile: int, overlap: int) -> torch.Tensor:
+    def _run_model(self, x_bchw: torch.Tensor, model: nn.Module, tile: int, overlap: int, verbose: bool) -> torch.Tensor:
         def fn(inp):
             with torch.no_grad():
                 return model(inp)
@@ -326,6 +357,7 @@ class IRNDownscale:
                 xs[-1] = max(0, w - tile)
             if ys[-1] + tile > h:
                 ys[-1] = max(0, h - tile)
+            _log(verbose, f"Tiled inference: tile={tile} overlap={overlap} stride={stride} grid={len(xs)}x{len(ys)}")
             pieces = {}
             for yy in ys:
                 for xx in xs:
@@ -344,26 +376,29 @@ class IRNDownscale:
             return out
         return fn(x_bchw)
 
-    def _pick_model_path(self, model_key: str, registry: Dict, scale: int, auto_download_selected: bool, auto_download_all: bool, use_google_drive: bool) -> Tuple[Optional[str], str, str]:
+    def _pick_model_path(self, model_key: str, registry: Dict, scale: int, auto_download_selected: bool, auto_download_all: bool, use_google_drive: bool, verbose: bool) -> Tuple[Optional[str], str, str]:
         models_dir = os.path.expanduser(registry.get("models_dir", DEFAULT_MODELS_DIR))
         if auto_download_all:
+            _log(verbose, "auto_download_all=True: attempting to prefetch all registry models")
             for k, v in registry.get("models", {}).items():
                 if v.get("source") == "builtin":
                     continue
                 if v.get("url"):
                     try:
-                        _ensure_model_from_registry(k, registry)
-                    except Exception:
-                        pass
+                        _ensure_model_from_registry(k, registry, verbose=verbose)
+                    except Exception as e:
+                        _log(verbose, f"Prefetch failed for {k}: {e}")
             if use_google_drive and download_gdrive_folder and registry.get("google_drive_folder_url"):
                 try:
+                    _log(verbose, f"Prefetch via Google Drive folder -> {models_dir}")
                     download_gdrive_folder(registry["google_drive_folder_url"], models_dir)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log(verbose, f"GDrive prefetch failed: {e}")
 
         keys, merged = _build_model_choices(registry)
+        orig_key = model_key
         if model_key == "auto_best_match":
-            candidate = f"IRN_x{{scale}}"
+            candidate = f"IRN_x{scale}"
             if candidate in merged:
                 model_key = candidate
             else:
@@ -374,88 +409,122 @@ class IRNDownscale:
                     if m and str(scale) == m.group(1):
                         model_key = k
                         break
+        _log(verbose, f"Model key requested='{orig_key}' resolved='{model_key}' scale={scale}")
 
         entry = merged.get(model_key, {})
         kind = entry.get("_kind", "")
 
         if model_key == "builtin_bicubic":
+            _log(verbose, f"Using builtin downscale mode (no model file).")
             return None, "builtin", model_key
         if kind == "local":
-            return entry.get("path"), "local", model_key
+            path = entry.get("path")
+            _log(verbose, f"Using local model: {path}")
+            return path, "local", model_key
         if kind == "registry":
             if auto_download_selected:
-                path = _ensure_model_from_registry(model_key, registry)
+                _log(verbose, f"Ensuring registry model present: {model_key}")
+                path = _ensure_model_from_registry(model_key, registry, verbose=verbose)
             else:
-                filename = entry.get("filename") or f"{{model_key}}.pt"
+                filename = entry.get("filename") or f"{model_key}.pt"
                 path = os.path.join(models_dir, filename)
                 path = path if os.path.exists(path) else None
+                _log(verbose, f"Registry model (no auto-download): looking for {path or '(missing)'}")
             if not path and use_google_drive and download_gdrive_folder and registry.get("google_drive_folder_url"):
                 try:
+                    _log(verbose, f"Trying Google Drive folder for {model_key} -> {models_dir}")
                     download_gdrive_folder(registry["google_drive_folder_url"], models_dir)
-                    filename = entry.get("filename") or f"{{model_key}}.pt"
+                    filename = entry.get("filename") or f"{model_key}.pt"
                     cand = os.path.join(models_dir, filename)
                     if os.path.exists(cand):
                         path = cand
-                except Exception:
-                    pass
+                        _log(verbose, f"Found model after GDrive: {cand}")
+                except Exception as e:
+                    _log(verbose, f"GDrive attempt failed for {model_key}: {e}")
+            if path:
+                _log(verbose, f"Using registry model: {path}")
+            else:
+                _log(verbose, f"Registry model unavailable; will fallback to builtin.")
             return path, "registry", model_key
+        _log(verbose, f"Unknown model key kind='{kind}', falling back to builtin")
         return None, "unknown", model_key
 
     def downscale(self, image, model_key, scale, device="auto", precision="fp16",
                   tile_size=0, tile_overlap=16, not_divisible_mode="pad",
                   builtin_mode="bicubic", keep_alpha=True,
                   auto_download_selected=True, auto_download_all=False,
-                  use_google_drive=True, models_dir_override=""):
+                  use_google_drive=True, models_dir_override="",
+                  verbose=True):
         t0 = time.time()
-        registry = _load_registry()
+        registry = _load_registry(verbose=verbose)
         if models_dir_override.strip():
             registry["models_dir"] = models_dir_override.strip()
+            _log(verbose, f"Override models_dir: {registry['models_dir']}")
 
         device = _pick_device(device)
         dtype = _pick_dtype(precision)
+        _log(verbose, f"Start downscale: scale={scale} device={device} dtype={dtype} "
+                      f"tile_size={tile_size} tile_overlap={tile_overlap} "
+                      f"mode={not_divisible_mode} builtin={builtin_mode} keep_alpha={keep_alpha}")
 
         has_alpha = (image.shape[-1] == 4) and keep_alpha
         if has_alpha:
+            _log(verbose, "Alpha channel detected; will downscale alpha with area mode and reattach")
             rgb = image[:, :, :, :3]
             alpha = image[:, :, :, 3:4]
         else:
             rgb = image
             alpha = None
 
-        rgb_chw, _ = self._maybe_prepare_input(rgb, scale, not_divisible_mode)
+        rgb_chw, _ = self._maybe_prepare_input(rgb, scale, not_divisible_mode, verbose)
         rgb_chw = rgb_chw.to(device=device, dtype=dtype)
+        _log(verbose, f"Prepared RGB input: shape={tuple(rgb_chw.shape)} on {device} dtype={dtype}")
 
+        mp_t0 = time.time()
         model_path, kind, resolved_key = self._pick_model_path(
-            model_key, registry, scale, auto_download_selected, auto_download_all, use_google_drive
+            model_key, registry, scale, auto_download_selected, auto_download_all, use_google_drive, verbose
         )
+        _log(verbose, f"Model selection time: {round(time.time()-mp_t0, 4)}s")
 
         used_model = "builtin"
         if model_path is None:
+            _log(verbose, f"Executing builtin {builtin_mode} downscale")
             out_rgb_chw = _downscale_builtin(rgb_chw, scale, mode=builtin_mode)
             used_model = "builtin"
             load_error = ""
         else:
             try:
-                cache_key = f"{{model_path}}:{{scale}}:{{str(device)}}:{{str(dtype)}}"
+                cache_key = f"{model_path}:{scale}:{str(device)}:{str(dtype)}"
                 if cache_key not in self._cache:
-                    self._cache[cache_key] = _load_model_generic(model_path, device, dtype, scale)
+                    _log(verbose, f"Loading model into cache: {cache_key}")
+                    mdl_t0 = time.time()
+                    self._cache[cache_key] = _load_model_generic(model_path, device, dtype, scale, verbose=verbose)
+                    _log(verbose, f"Model loaded in {round(time.time()-mdl_t0, 4)}s")
+                else:
+                    _log(verbose, f"Reusing cached model: {cache_key}")
                 model = self._cache[cache_key]
-                out_rgb_chw = self._run_model(rgb_chw, model, tile_size, tile_overlap)
-                used_model = f"{{kind}}:{{os.path.basename(model_path)}}"
+                _log(verbose, "Running inference...")
+                inf_t0 = time.time()
+                out_rgb_chw = self._run_model(rgb_chw, model, tile_size, tile_overlap, verbose)
+                _log(verbose, f"Inference done in {round(time.time()-inf_t0, 4)}s")
+                used_model = f"{kind}:{os.path.basename(model_path)}"
                 load_error = ""
             except Exception as e:
+                _log(verbose, f"Model execution failed, falling back to builtin: {e}")
                 out_rgb_chw = _downscale_builtin(rgb_chw, scale, mode=builtin_mode)
                 load_error = str(e)
                 used_model = f"fallback_builtin_due_to_error"
 
         out_rgb_bhwc = _to_bhwc(out_rgb_chw.to(dtype=torch.float32, device="cpu")).clamp(0, 1)
+        _log(verbose, f"Output RGB shape: {tuple(out_rgb_bhwc.shape)}")
 
         if alpha is not None:
-            a_chw, _ = self._maybe_prepare_input(alpha, scale, not_divisible_mode)
+            a_chw, _ = self._maybe_prepare_input(alpha, scale, not_divisible_mode, verbose)
             a_chw = a_chw.to(device=device, dtype=dtype)
             out_a_chw = _downscale_builtin(a_chw, scale, mode="area")
             out_a_bhwc = _to_bhwc(out_a_chw.to(dtype=torch.float32, device="cpu")).clamp(0, 1)
             out = torch.cat([out_rgb_bhwc, out_a_bhwc], dim=-1)
+            _log(verbose, f"Reattached alpha; final shape: {tuple(out.shape)}")
         else:
             out = out_rgb_bhwc
 
@@ -468,8 +537,11 @@ class IRNDownscale:
             if v.get("_kind") == "local":
                 local_list.append(v.get("filename", k))
             elif v.get("_kind") == "registry":
-                fn = v.get("filename", f"{{k}}.pt")
-                local_list.append(fn if os.path.exists(os.path.join(models_dir, fn)) else f"{{fn}} (missing)")
+                fn = v.get("filename", f"{k}.pt")
+                local_list.append(fn if os.path.exists(os.path.join(models_dir, fn)) else f"{fn} (missing)")
+
+        elapsed = round(time.time() - t0, 4)
+        _log(verbose, f"Done. used_model={used_model} resolved_key={resolved_key} elapsed={elapsed}s")
 
         meta = {
             "model_used": used_model,
@@ -484,7 +556,7 @@ class IRNDownscale:
             "auto_download_all": bool(auto_download_all),
             "use_google_drive": bool(use_google_drive),
             "available_models": local_list,
-            "elapsed_sec": round(time.time() - t0, 4),
+            "elapsed_sec": elapsed,
             "load_error": load_error if 'load_error' in locals() and load_error else ""
         }
         return (out, meta)
