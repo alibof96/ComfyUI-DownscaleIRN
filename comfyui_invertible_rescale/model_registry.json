@@ -1,0 +1,29 @@
+{
+  "models_dir": "~/ComfyUI/models/invertible_rescale",
+  "google_drive_folder_url": "https://drive.google.com/drive/folders/1ym6DvYNQegDrOy_4z733HxrULa1XIN92",
+  "models": {
+    "builtin_bicubic": {
+      "description": "Uses PyTorch interpolate (bicubic/area). No download.",
+      "scale": [2, 3, 4],
+      "source": "builtin"
+    },
+    "IRN_x2": {
+      "description": "Invertible Image Rescaling x2 (official BasicSR .pth in Google Drive; or set a direct URL here).",
+      "scale": [2],
+      "url": "",
+      "filename": "IRN_x2.pth"
+    },
+    "IRN_x3": {
+      "description": "Invertible Image Rescaling x3 (official BasicSR .pth in Google Drive; or set a direct URL here).",
+      "scale": [3],
+      "url": "",
+      "filename": "IRN_x3.pth"
+    },
+    "IRN_x4": {
+      "description": "Invertible Image Rescaling x4 (official BasicSR .pth in Google Drive; or set a direct URL here).",
+      "scale": [4],
+      "url": "",
+      "filename": "IRN_x4.pth"
+    }
+  }
+}
