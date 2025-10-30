@@ -101,7 +101,7 @@ class ConvDownsampling(nn.Module):
             x = x.reshape(B, C, H // self.scale, self.scale, W // self.scale, self.scale)
             x = x.permute(0, 1, 3, 5, 2, 4)
             x = x.reshape(B, C * self.scale2, H // self.scale, W // self.scale)
-            conv_weights = self.conv_weights.reshape(self.scale2, self.scale2, 1, 1)
+            conv_weights = self.conv_weights.to(dtype=x.dtype, device=x.device).reshape(self.scale2, self.scale2, 1, 1)
             conv_weights = conv_weights.repeat(C, 1, 1, 1)
             out = F.conv2d(x, conv_weights, bias=None, stride=1, groups=C)
             out = out.reshape(B, C, self.scale, self.scale, H // self.scale, W // self.scale)
@@ -109,7 +109,7 @@ class ConvDownsampling(nn.Module):
             out = out.reshape(B, C * self.scale2, H // self.scale, W // self.scale)
             return out
         else:
-            inv_weights = torch.inverse(self.conv_weights)
+            inv_weights = torch.inverse(self.conv_weights.to(dtype=x.dtype, device=x.device))
             inv_weights = inv_weights.reshape(self.scale2, self.scale2, 1, 1)
             [B, C_, H_, W_] = list(x.size())
             C = C_ // self.scale2
