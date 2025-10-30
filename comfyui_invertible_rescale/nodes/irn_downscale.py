@@ -285,6 +285,62 @@ def _build_model_choices(registry: Dict) -> Tuple[List[str], Dict[str, Dict]]:
     keys = order + [k for k in sorted(merged.keys()) if k not in order]
     return keys, merged
 
+def _blend_overlap_frames(frames: List[torch.Tensor], overlap: int, verbose: bool = False) -> torch.Tensor:
+    """
+    Blend overlapping frames using weighted averaging at boundaries.
+    
+    Args:
+        frames: List of frame tensors, each with shape [batch_size, H, W, C]
+        overlap: Number of overlapping frames between batches
+        verbose: Whether to log blending operations
+    
+    Returns:
+        Combined tensor with overlapping frames blended
+    """
+    if len(frames) == 0:
+        raise ValueError("Cannot blend empty frame list")
+    
+    if len(frames) == 1:
+        return frames[0]
+    
+    if overlap == 0:
+        # No overlap, just concatenate
+        return torch.cat(frames, dim=0)
+    
+    result = []
+    for i, batch_frames in enumerate(frames):
+        if i == 0:
+            # First batch: keep all frames
+            result.append(batch_frames)
+            _log(verbose, f"Batch {i}: Added all {batch_frames.shape[0]} frames")
+        else:
+            # Subsequent batches: blend the overlapping region
+            prev_overlap_frames = result[-1][-overlap:]
+            curr_overlap_frames = batch_frames[:overlap]
+            
+            # Create blending weights (linear ramp)
+            # First overlap frame: more weight to previous, last overlap frame: more weight to current
+            blended_overlap = []
+            for j in range(overlap):
+                weight_curr = (j + 1) / (overlap + 1)
+                weight_prev = 1.0 - weight_curr
+                blended = weight_prev * prev_overlap_frames[j] + weight_curr * curr_overlap_frames[j]
+                blended_overlap.append(blended)
+            
+            blended_overlap = torch.stack(blended_overlap, dim=0)
+            
+            # Replace the overlapping frames in result with blended versions
+            result[-1] = torch.cat([result[-1][:-overlap], blended_overlap], dim=0)
+            
+            # Add remaining frames from current batch (skip the overlap)
+            if batch_frames.shape[0] > overlap:
+                result.append(batch_frames[overlap:])
+                _log(verbose, f"Batch {i}: Blended {overlap} overlap frames, added {batch_frames.shape[0] - overlap} new frames")
+            else:
+                _log(verbose, f"Batch {i}: Blended {overlap} overlap frames (entire batch)")
+    
+    return torch.cat(result, dim=0)
+
 class IRNDownscale:
     def __init__(self):
         self._cache: Dict[str, nn.Module] = {}
@@ -312,6 +368,8 @@ class IRNDownscale:
                 "use_google_drive": ("BOOLEAN", {"default": True}),
                 "models_dir_override": ("STRING", {"default": ""}),
                 "verbose": ("BOOLEAN", {"default": True}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 9999, "step": 1}),
+                "overlap": ("INT", {"default": 2, "min": 0, "max": 16, "step": 1}),
             }
         }
 
@@ -454,7 +512,7 @@ class IRNDownscale:
                   builtin_mode="bicubic", keep_alpha=True,
                   auto_download_selected=True, auto_download_all=False,
                   use_google_drive=True, models_dir_override="",
-                  verbose=True):
+                  verbose=True, batch_size=1, overlap=2):
         t0 = time.time()
         registry = _load_registry(verbose=verbose)
         if models_dir_override.strip():
@@ -467,6 +525,10 @@ class IRNDownscale:
                       f"tile_size={tile_size} tile_overlap={tile_overlap} "
                       f"mode={not_divisible_mode} builtin={builtin_mode} keep_alpha={keep_alpha}")
 
+        # Batch processing setup
+        input_frame_count = image.shape[0]
+        _log(verbose, f"Input frame count: {input_frame_count}, batch_size: {batch_size}, overlap: {overlap}")
+        
         has_alpha = (image.shape[-1] == 4) and keep_alpha
         if has_alpha:
             _log(verbose, "Alpha channel detected; will downscale alpha with area mode and reattach")
@@ -476,57 +538,101 @@ class IRNDownscale:
             rgb = image
             alpha = None
 
-        rgb_chw, _ = self._maybe_prepare_input(rgb, scale, not_divisible_mode, verbose)
-        rgb_chw = rgb_chw.to(device=device, dtype=dtype)
-        _log(verbose, f"Prepared RGB input: shape={tuple(rgb_chw.shape)} on {device} dtype={dtype}")
-
         mp_t0 = time.time()
         model_path, kind, resolved_key = self._pick_model_path(
             model_key, registry, scale, auto_download_selected, auto_download_all, use_google_drive, verbose
         )
         _log(verbose, f"Model selection time: {round(time.time()-mp_t0, 4)}s")
 
+        # Process frames in batches with overlap
+        processed_rgb_batches = []
+        processed_alpha_batches = []
+        
+        # Calculate batch indices with overlap
+        num_frames = rgb.shape[0]
+        batch_indices = []
+        i = 0
+        while i < num_frames:
+            start_idx = max(0, i - overlap) if i > 0 else 0
+            end_idx = min(i + batch_size, num_frames)
+            batch_indices.append((start_idx, end_idx))
+            i += batch_size
+            
+        _log(verbose, f"Processing {len(batch_indices)} batches with overlap={overlap}")
+        
         used_model = "builtin"
-        if model_path is None:
-            _log(verbose, f"Executing builtin {builtin_mode} downscale")
-            out_rgb_chw = _downscale_builtin(rgb_chw, scale, mode=builtin_mode)
-            used_model = "builtin"
-            load_error = ""
-        else:
-            try:
-                cache_key = f"{model_path}:{scale}:{str(device)}:{str(dtype)}"
-                if cache_key not in self._cache:
-                    _log(verbose, f"Loading model into cache: {cache_key}")
-                    mdl_t0 = time.time()
-                    self._cache[cache_key] = _load_model_generic(model_path, device, dtype, scale, verbose=verbose)
-                    _log(verbose, f"Model loaded in {round(time.time()-mdl_t0, 4)}s")
-                else:
-                    _log(verbose, f"Reusing cached model: {cache_key}")
-                model = self._cache[cache_key]
-                _log(verbose, "Running inference...")
-                inf_t0 = time.time()
-                out_rgb_chw = self._run_model(rgb_chw, model, tile_size, tile_overlap, verbose)
-                _log(verbose, f"Inference done in {round(time.time()-inf_t0, 4)}s")
-                used_model = f"{kind}:{os.path.basename(model_path)}"
-                load_error = ""
-            except Exception as e:
-                _log(verbose, f"Model execution failed, falling back to builtin: {e}")
+        load_error = ""
+        
+        for batch_num, (start_idx, end_idx) in enumerate(batch_indices):
+            _log(verbose, f"Processing batch {batch_num + 1}/{len(batch_indices)}: frames {start_idx}-{end_idx - 1}")
+            
+            # Extract batch
+            rgb_batch = rgb[start_idx:end_idx]
+            
+            # Prepare input
+            rgb_chw, _ = self._maybe_prepare_input(rgb_batch, scale, not_divisible_mode, verbose)
+            rgb_chw = rgb_chw.to(device=device, dtype=dtype)
+            
+            # Process batch
+            if model_path is None:
+                if batch_num == 0:
+                    _log(verbose, f"Executing builtin {builtin_mode} downscale")
+                    used_model = "builtin"
                 out_rgb_chw = _downscale_builtin(rgb_chw, scale, mode=builtin_mode)
-                load_error = str(e)
-                used_model = f"fallback_builtin_due_to_error"
-
-        out_rgb_bhwc = _to_bhwc(out_rgb_chw.to(dtype=torch.float32, device="cpu")).clamp(0, 1)
-        _log(verbose, f"Output RGB shape: {tuple(out_rgb_bhwc.shape)}")
-
+            else:
+                try:
+                    cache_key = f"{model_path}:{scale}:{str(device)}:{str(dtype)}"
+                    if cache_key not in self._cache:
+                        _log(verbose, f"Loading model into cache: {cache_key}")
+                        mdl_t0 = time.time()
+                        self._cache[cache_key] = _load_model_generic(model_path, device, dtype, scale, verbose=verbose)
+                        _log(verbose, f"Model loaded in {round(time.time()-mdl_t0, 4)}s")
+                    else:
+                        if batch_num == 0:
+                            _log(verbose, f"Reusing cached model: {cache_key}")
+                    model = self._cache[cache_key]
+                    inf_t0 = time.time()
+                    out_rgb_chw = self._run_model(rgb_chw, model, tile_size, tile_overlap, verbose)
+                    _log(verbose, f"Batch {batch_num + 1} inference done in {round(time.time()-inf_t0, 4)}s")
+                    if batch_num == 0:
+                        used_model = f"{kind}:{os.path.basename(model_path)}"
+                except Exception as e:
+                    _log(verbose, f"Model execution failed, falling back to builtin: {e}")
+                    out_rgb_chw = _downscale_builtin(rgb_chw, scale, mode=builtin_mode)
+                    load_error = str(e)
+                    if batch_num == 0:
+                        used_model = f"fallback_builtin_due_to_error"
+            
+            out_rgb_bhwc = _to_bhwc(out_rgb_chw.to(dtype=torch.float32, device="cpu")).clamp(0, 1)
+            processed_rgb_batches.append(out_rgb_bhwc)
+            
+            # Process alpha channel if present
+            if alpha is not None:
+                alpha_batch = alpha[start_idx:end_idx]
+                a_chw, _ = self._maybe_prepare_input(alpha_batch, scale, not_divisible_mode, verbose)
+                a_chw = a_chw.to(device=device, dtype=dtype)
+                out_a_chw = _downscale_builtin(a_chw, scale, mode="area")
+                out_a_bhwc = _to_bhwc(out_a_chw.to(dtype=torch.float32, device="cpu")).clamp(0, 1)
+                processed_alpha_batches.append(out_a_bhwc)
+        
+        # Blend overlapping frames
+        _log(verbose, "Blending overlapping frames...")
+        out_rgb_bhwc = _blend_overlap_frames(processed_rgb_batches, overlap, verbose)
+        
         if alpha is not None:
-            a_chw, _ = self._maybe_prepare_input(alpha, scale, not_divisible_mode, verbose)
-            a_chw = a_chw.to(device=device, dtype=dtype)
-            out_a_chw = _downscale_builtin(a_chw, scale, mode="area")
-            out_a_bhwc = _to_bhwc(out_a_chw.to(dtype=torch.float32, device="cpu")).clamp(0, 1)
+            out_a_bhwc = _blend_overlap_frames(processed_alpha_batches, overlap, verbose)
             out = torch.cat([out_rgb_bhwc, out_a_bhwc], dim=-1)
             _log(verbose, f"Reattached alpha; final shape: {tuple(out.shape)}")
         else:
             out = out_rgb_bhwc
+        
+        # Integrity check: verify output frame count matches input
+        output_frame_count = out.shape[0]
+        if output_frame_count != input_frame_count:
+            _log(verbose, f"WARNING: Frame count mismatch! Input: {input_frame_count}, Output: {output_frame_count}")
+            raise RuntimeError(f"Frame count integrity check failed: input={input_frame_count}, output={output_frame_count}")
+        else:
+            _log(verbose, f"Integrity check passed: {output_frame_count} frames in/out")
 
         keys, merged = _build_model_choices(registry)
         local_list = []
@@ -557,6 +663,11 @@ class IRNDownscale:
             "use_google_drive": bool(use_google_drive),
             "available_models": local_list,
             "elapsed_sec": elapsed,
-            "load_error": load_error if 'load_error' in locals() and load_error else ""
+            "load_error": load_error if 'load_error' in locals() and load_error else "",
+            "batch_size": int(batch_size),
+            "overlap": int(overlap),
+            "input_frame_count": int(input_frame_count),
+            "output_frame_count": int(output_frame_count),
+            "num_batches": len(batch_indices) if 'batch_indices' in locals() else 1
         }
         return (out, meta)
